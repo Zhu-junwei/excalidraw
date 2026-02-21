@@ -1,0 +1,78 @@
+name: Auto Sync Fork
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Setup git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Detect upstream and branches
+        id: upstream
+        run: |
+          REPO_INFO=$(gh api repos/${{ github.repository }})
+
+          UPSTREAM_URL=$(echo "$REPO_INFO" | jq -r '.parent.clone_url')
+          UPSTREAM_BRANCH=$(echo "$REPO_INFO" | jq -r '.parent.default_branch')
+          FORK_BRANCH=$(echo "$REPO_INFO" | jq -r '.default_branch')
+
+          if [ "$UPSTREAM_URL" = "null" ]; then
+            echo "This repo does not have an upstream (not a fork)."
+            exit 1
+          fi
+
+          echo "UPSTREAM_URL=$UPSTREAM_URL" >> $GITHUB_ENV
+          echo "UPSTREAM_BRANCH=$UPSTREAM_BRANCH" >> $GITHUB_ENV
+          echo "FORK_BRANCH=$FORK_BRANCH" >> $GITHUB_ENV
+
+          echo "Upstream: $UPSTREAM_URL ($UPSTREAM_BRANCH)"
+          echo "Fork default branch: $FORK_BRANCH"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL" || true
+          git fetch upstream
+
+      - name: Check for changes in upstream (ignoring sync.yml)
+        id: check_changes
+        run: |
+          git fetch upstream
+          UPSTREAM_DIFF=$(git diff --name-only upstream/${UPSTREAM_BRANCH}..HEAD | grep -v '.github/workflows/sync.yml' || true)
+          echo "Upstream changes (excluding sync.yml): $UPSTREAM_DIFF"
+
+          if [ -z "$UPSTREAM_DIFF" ]; then
+            echo "has_changes=false" >> $GITHUB_ENV
+          else
+            echo "has_changes=true" >> $GITHUB_ENV
+          fi
+
+      - name: Reset fork to upstream (exclude workflow)
+        if: env.has_changes == 'true'
+        run: |
+          cp -r .github/workflows/sync.yml ../sync.yml.bak
+          git reset --hard upstream/${UPSTREAM_BRANCH}
+          mkdir -p .github/workflows
+          mv ../sync.yml.bak .github/workflows/sync.yml
+          git add .github/workflows/sync.yml
+          git commit -m "ci: restore workflow" || echo "No changes to commit"
+
+      - name: Push changes
+        if: env.has_changes == 'true'
+        run: |
+          echo "Pushing HEAD to ${FORK_BRANCH}"
+          git push https://${{ secrets.ACTION_PAT }}@github.com/${{ github.repository }}.git \
+            HEAD:${FORK_BRANCH} --force
