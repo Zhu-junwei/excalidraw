@@ -1,0 +1,84 @@
+name: Auto Sync Fork
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Detect upstream and branches
+        id: upstream
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO_INFO=$(gh api repos/${{ github.repository }})
+
+          UPSTREAM_URL=$(echo "$REPO_INFO" | jq -r '.parent.clone_url')
+          UPSTREAM_BRANCH=$(echo "$REPO_INFO" | jq -r '.parent.default_branch')
+          FORK_BRANCH=$(echo "$REPO_INFO" | jq -r '.default_branch')
+
+          if [ "$UPSTREAM_URL" = "null" ] || [ -z "$UPSTREAM_URL" ]; then
+            echo "This repo does not have an upstream (not a fork)."
+            exit 1
+          fi
+
+          echo "UPSTREAM_URL=$UPSTREAM_URL" >> "$GITHUB_ENV"
+          echo "UPSTREAM_BRANCH=$UPSTREAM_BRANCH" >> "$GITHUB_ENV"
+          echo "FORK_BRANCH=$FORK_BRANCH" >> "$GITHUB_ENV"
+
+          echo "Upstream: $UPSTREAM_URL ($UPSTREAM_BRANCH)"
+          echo "Fork default branch: $FORK_BRANCH"
+
+      - name: Add upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL" || true
+          git fetch upstream
+
+      - name: Check for changes in upstream (excluding .github)
+        id: check_changes
+        run: |
+          git fetch upstream
+          UPSTREAM_DIFF=$(git diff --name-only HEAD..upstream/${UPSTREAM_BRANCH} | grep -v '^.github/' || true)
+          echo "Upstream changes (excluding .github): $UPSTREAM_DIFF"
+
+          if [ -z "$UPSTREAM_DIFF" ]; then
+            echo "has_changes=false" >> "$GITHUB_ENV"
+          else
+            echo "has_changes=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Reset fork to upstream (preserve .github)
+        if: env.has_changes == 'true'
+        run: |
+          cp -r .github /tmp/fork-github.bak
+          git reset --hard upstream/${UPSTREAM_BRANCH}
+          rm -rf .github
+          cp -r /tmp/fork-github.bak .github
+          git add -A .github
+          git commit -m "ci: restore fork .github" || echo "No changes to commit"
+
+      - name: Push changes
+        if: env.has_changes == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Pushing upstream/${UPSTREAM_BRANCH} to ${FORK_BRANCH}"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" \
+            HEAD:${FORK_BRANCH} --force
